@@ -1,0 +1,28 @@
+bundle_id: springfield-isd-acme-tutor-2026-001
+decision_card_url: https://district.example/.well-known/decisions/SPRINGFIELD-DEC-2026-001.json
+rules:
+  - id: deny-destructive-prod-actions
+    priority: 100
+    effect: deny
+    tool_name: "^(filesystem|github)\\..*(delete|destroy|drop).*"
+    caller_id: ".*"
+    when:
+      expr: "context.get('environment') == 'production'"
+    because:
+      decision_card: https://district.example/.well-known/decisions/SPRINGFIELD-DEC-2026-001.json
+      condition_id: no-destructive-prod-actions
+
+  - id: require-approval-pii-tools
+    priority: 80
+    effect: require_approval
+    tool_name: "^pii\\..*"
+    caller_id: "^acme-tutor-.*"
+    because:
+      decision_card: https://district.example/.well-known/decisions/SPRINGFIELD-DEC-2026-001.json
+      condition_id: human-approval-for-pii-tools
+
+  - id: allow-read-only-baseline
+    priority: 10
+    effect: allow
+    tool_name: "^(filesystem|github)\\.(read|get|list|search).*"
+    caller_id: "^acme-tutor-.*"

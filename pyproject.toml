@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-permission-broker"
+version = "0.1.0"
+description = "Runtime permission broker for MCP tool invocations. Composes AI Procurement Decision Cards into PolicyBundles, applies deny-trumps-allow rules at request time, emits tamper-evident audit-stream events. The runtime enforcement point of the Kinetic Gain Protocol Suite."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Miz Causevic", email = "miz@kineticgain.com" },
+]
+keywords = [
+    "mcp", "model-context-protocol", "permission-broker", "policy-enforcement",
+    "ai-governance", "decision-intelligence", "kinetic-gain-protocol-suite",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Security",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+]
+dev = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "httpx>=0.27",
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "types-PyYAML>=6.0",
+]
+
+[project.urls]
+Homepage      = "https://github.com/mizcausevic-dev/mcp-permission-broker"
+Repository    = "https://github.com/mizcausevic-dev/mcp-permission-broker"
+"Bug Tracker" = "https://github.com/mizcausevic-dev/mcp-permission-broker/issues"
+"Kinetic Gain Protocol Suite" = "https://suite.kineticgain.com"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_permission_broker"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "W"]
+
+[tool.mypy]
+strict = true
+warn_unused_ignores = true
+ignore_missing_imports = true
