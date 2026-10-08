@@ -1,4 +1,4 @@
-"""mcp-permission-broker — runtime gate for MCP tool invocations.
+"""mcp-permission-broker — embeddable policy rule evaluator.
 
 See README.md for design and usage. Public surface:
 

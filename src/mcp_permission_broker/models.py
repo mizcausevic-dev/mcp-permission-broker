@@ -11,15 +11,21 @@ Outcome = Literal["allow", "deny", "require_approval"]
 
 
 class PermissionRequest(BaseModel):
-    """An MCP tool invocation, presented to the broker for a decision."""
+    """An invocation supplied by a host. The broker does not authenticate its caller."""
 
     model_config = ConfigDict(extra="forbid")
 
     caller_id: str = Field(
-        ..., description="Identity of the agent / tool client (e.g. agent_card.system_id)."
+        ...,
+        min_length=1,
+        max_length=256,
+        description="Caller identifier asserted by the embedding application.",
     )
     tool_name: str = Field(
-        ..., description="The MCP tool being invoked (e.g. 'github.search_repositories')."
+        ...,
+        min_length=1,
+        max_length=256,
+        description="Tool identifier asserted by the embedding application.",
     )
     tool_args: dict[str, Any] = Field(
         default_factory=dict,
@@ -32,7 +38,7 @@ class PermissionRequest(BaseModel):
 
 
 class _Because(BaseModel):
-    """Provenance for why a rule exists — typically traces back to a Decision Card."""
+    """Operator-supplied reference metadata; neither the card nor URL is verified."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -45,11 +51,10 @@ class _Because(BaseModel):
 
 
 class PolicyRule(BaseModel):
-    """A single rule. Matched against PermissionRequest via regex on tool_name + caller_id.
+    """Local rule matched by regex and a restricted context condition grammar.
 
-    Optional `when.expr` is a Python expression evaluated against a single
-    bound name `context` (the request's context dict). The expression is
-    evaluated with no builtins to limit blast radius.
+    A condition cannot run Python code. Rule patterns still use Python ``re``
+    without a match timeout; load only reviewed patterns until that is fixed.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -57,18 +62,27 @@ class PolicyRule(BaseModel):
     id: str
     priority: int = 0
     effect: Outcome
-    tool_name: str = Field(default=".*", description="Regex matched against request.tool_name.")
-    caller_id: str = Field(default=".*", description="Regex matched against request.caller_id.")
+    tool_name: str = Field(
+        default=".*",
+        min_length=1,
+        max_length=256,
+        description="Regex matched against request.tool_name.",
+    )
+    caller_id: str = Field(
+        default=".*",
+        min_length=1,
+        max_length=256,
+        description="Regex matched against request.caller_id.",
+    )
     when: dict[str, str] | None = Field(
         default=None,
-        description="Optional {'expr': <python expression over `context`>}.",
+        description="Optional {'expr': <restricted condition over `context`>}.",
     )
     because: _Because | None = None
 
 
 class PolicyBundle(BaseModel):
-    """A named collection of rules. Typically produced by policy-as-code-engine
-    from a single AI Procurement Decision Card."""
+    """A local rules[] bundle, incompatible with policy-as-code-engine policies[]."""
 
     model_config = ConfigDict(extra="forbid")
 

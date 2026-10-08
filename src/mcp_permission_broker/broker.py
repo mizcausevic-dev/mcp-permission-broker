@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
@@ -86,8 +87,23 @@ class Broker:
         matches: list[tuple[PolicyRule, PolicyBundle]] = []
         for bundle in self._bundles.values():
             for rule in bundle.rules:
-                if self._rule_matches(rule, request):
-                    matches.append((rule, bundle))
+                try:
+                    if self._rule_matches(rule, request):
+                        matches.append((rule, bundle))
+                except Exception as exc:
+                    # A broken condition or pattern must never remove a deny
+                    # from consideration and let another allow rule win.
+                    logger.warning(
+                        "policy rule %s failed to evaluate: %s", rule.id, type(exc).__name__
+                    )
+                    decision = PermissionDecision(
+                        outcome="deny",
+                        matched_rules=[rule.id],
+                        decision_card_refs=_card_refs(bundle),
+                        rationale=f"Policy rule {rule.id} failed to evaluate",
+                    )
+                    self._emit_audit(decision, request)
+                    return decision
 
         # Sort by priority descending so the first deny we encounter is the highest-priority one.
         matches.sort(key=lambda pair: pair[0].priority, reverse=True)
@@ -103,16 +119,10 @@ class Broker:
             return False
         if not re.fullmatch(rule.caller_id, request.caller_id):
             return False
-        if rule.when:
-            expr = rule.when.get("expr", "")
-            if not expr:
-                return True
-            try:
-                # Restricted eval: no builtins, single binding.
-                return bool(eval(expr, {"__builtins__": {}}, {"context": request.context}))
-            except Exception as exc:
-                logger.warning("when.expr evaluation failed for rule %s: %s", rule.id, exc)
-                return False
+        if rule.when is not None:
+            if set(rule.when) != {"expr"} or not rule.when["expr"].strip():
+                raise ValueError("when must contain one nonempty expr")
+            return _evaluate_condition(rule.when["expr"], request.context)
         return True
 
     def _resolve(
@@ -161,19 +171,83 @@ class Broker:
             return
         event = {
             "kind": _AUDIT_EVENT_KIND[decision.outcome],
-            "correlation_id": decision.correlation_id,
-            "caller_id": request.caller_id,
-            "tool_name": request.tool_name,
-            "matched_rules": decision.matched_rules,
-            "decision_card_refs": decision.decision_card_refs,
-            "rationale": decision.rationale,
+            "source": "mcp-permission-broker",
+            "payload": {
+                "correlation_id": decision.correlation_id,
+                "caller_id": request.caller_id,
+                "tool_name": request.tool_name,
+                "matched_rules": decision.matched_rules,
+                "decision_card_refs": decision.decision_card_refs,
+                "rationale": decision.rationale,
+            },
         }
         # Best-effort. Never raised.
         try:
-            httpx.post(self._audit_stream_url, json=event, timeout=2.0)
+            response = httpx.post(self._audit_stream_url, json=event, timeout=2.0)
+            response.raise_for_status()
         except Exception as exc:
-            logger.warning("audit-stream POST failed (best-effort): %s", exc)
+            logger.warning("audit-stream POST failed (best-effort): %s", type(exc).__name__)
 
 
 def _card_refs(bundle: PolicyBundle) -> list[str]:
     return [bundle.decision_card_url] if bundle.decision_card_url else []
+
+
+def _evaluate_condition(expr: str, context: dict[str, Any]) -> bool:
+    """Evaluate a deliberately small boolean grammar, never Python code."""
+    if len(expr) > 512:
+        raise ValueError("condition is too long")
+    tree = ast.parse(expr, mode="eval")
+
+    def visit(node: ast.AST, depth: int = 0) -> Any:
+        if depth > 16:
+            raise ValueError("condition is too deep")
+        if isinstance(node, ast.Constant):
+            if type(node.value) in (str, int, float, bool, type(None)):
+                return node.value
+        elif isinstance(node, (ast.List, ast.Tuple)):
+            if len(node.elts) <= 32:
+                return [visit(item, depth + 1) for item in node.elts]
+        elif isinstance(node, ast.Call):
+            target = node.func
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "context"
+                and target.attr == "get"
+                and not node.keywords
+                and 1 <= len(node.args) <= 2
+            ):
+                key = visit(node.args[0], depth + 1)
+                if not isinstance(key, str):
+                    raise ValueError("context key must be a string")
+                default = visit(node.args[1], depth + 1) if len(node.args) == 2 else None
+                return context.get(key, default)
+        elif isinstance(node, ast.Subscript):
+            if isinstance(node.value, ast.Name) and node.value.id == "context":
+                key = visit(node.slice, depth + 1)
+                if isinstance(key, str):
+                    return context[key]
+        elif isinstance(node, ast.BoolOp):
+            values = [bool(visit(item, depth + 1)) for item in node.values]
+            if isinstance(node.op, ast.And):
+                return all(values)
+            if isinstance(node.op, ast.Or):
+                return any(values)
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return not bool(visit(node.operand, depth + 1))
+        elif isinstance(node, ast.Compare) and len(node.ops) == 1:
+            left = visit(node.left, depth + 1)
+            right = visit(node.comparators[0], depth + 1)
+            op = node.ops[0]
+            if isinstance(op, ast.Eq):
+                return left == right
+            if isinstance(op, ast.NotEq):
+                return left != right
+            if isinstance(op, ast.In):
+                return left in right
+            if isinstance(op, ast.NotIn):
+                return left not in right
+        raise ValueError("unsupported condition syntax")
+
+    return bool(visit(tree.body))
