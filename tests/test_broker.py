@@ -226,7 +226,7 @@ def test_local_regex_timeout_denies(monkeypatch: pytest.MonkeyPatch) -> None:
     assert decision.matched_rules == ["slow"]
 
 
-@pytest.mark.parametrize("status", [401, 503])
+@pytest.mark.parametrize("status", [302, 401, 503])
 def test_non_2xx_audit_response_is_logged_without_leaking_url(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, status: int
 ) -> None:
@@ -235,11 +235,17 @@ def test_non_2xx_audit_response_is_logged_without_leaking_url(
     monkeypatch.setenv("AUDIT_STREAM_TOKEN", TEST_AUDIT_TOKEN)
 
     def failed_post(
-        url: str, *, json: dict[str, object], headers: dict[str, str], timeout: float
+        url: str,
+        *,
+        json: dict[str, object],
+        headers: dict[str, str],
+        timeout: float,
+        follow_redirects: bool,
     ) -> httpx.Response:
         events.append(json)
         urls.append(url)
         assert headers == {"Authorization": f"Bearer {TEST_AUDIT_TOKEN}"}
+        assert follow_redirects is False
         return httpx.Response(status, request=httpx.Request("POST", url))
 
     monkeypatch.setattr("mcp_permission_broker.broker.httpx.post", failed_post)
@@ -265,10 +271,16 @@ def test_audit_legacy_events_endpoint_is_not_duplicated(
     monkeypatch.setenv("AUDIT_STREAM_TOKEN", TEST_AUDIT_TOKEN)
 
     def accepted_post(
-        url: str, *, json: dict[str, object], headers: dict[str, str], timeout: float
+        url: str,
+        *,
+        json: dict[str, object],
+        headers: dict[str, str],
+        timeout: float,
+        follow_redirects: bool,
     ) -> httpx.Response:
         urls.append(url)
         assert headers == {"Authorization": f"Bearer {TEST_AUDIT_TOKEN}"}
+        assert follow_redirects is False
         return httpx.Response(201, request=httpx.Request("POST", url))
 
     monkeypatch.setattr("mcp_permission_broker.broker.httpx.post", accepted_post)
@@ -308,6 +320,7 @@ def test_audit_invalid_token_skips_post(
     "url",
     [
         "http://audit.example",
+        "http://localhost:8093",
         "https://user:password@audit.example",
         "https://audit.example?token=secret",
         "file:///tmp/audit.sock",
@@ -316,6 +329,11 @@ def test_audit_invalid_token_skips_post(
 def test_audit_rejects_insecure_or_credentialed_url(url: str) -> None:
     with pytest.raises(ValueError, match="audit stream URL"):
         Broker(audit_stream_url=url)
+
+
+@pytest.mark.parametrize("url", ["http://127.0.0.1:8093", "http://[::1]:8093"])
+def test_audit_accepts_numeric_loopback_http(url: str) -> None:
+    Broker(audit_stream_url=url)
 
 
 def _signed_card(

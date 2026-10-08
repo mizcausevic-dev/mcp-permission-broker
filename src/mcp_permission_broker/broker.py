@@ -329,6 +329,7 @@ class Broker:
                 json=event,
                 headers={"Authorization": f"Bearer {self._audit_stream_token}"},
                 timeout=2.0,
+                follow_redirects=False,
             )
             response.raise_for_status()
         except Exception as exc:
@@ -349,7 +350,7 @@ def _audit_events_url(raw_url: str) -> str:
         or url.userinfo
         or url.query
         or url.fragment
-        or (url.scheme == "http" and url.host not in {"localhost", "127.0.0.1", "::1"})
+        or (url.scheme == "http" and url.host not in {"127.0.0.1", "::1"})
     ):
         raise ValueError("audit stream URL must be HTTPS or loopback HTTP without credentials")
     path = url.path.rstrip("/")

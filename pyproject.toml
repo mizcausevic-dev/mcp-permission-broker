@@ -35,6 +35,7 @@ dependencies = [
     "pydantic>=2.7",
     "PyYAML>=6.0",
     "policy-as-code-engine==0.2.0",
+    "regex>=2024.11.6,<2027",
 ]
 
 [project.optional-dependencies]
