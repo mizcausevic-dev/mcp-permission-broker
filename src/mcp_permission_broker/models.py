@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 Outcome = Literal["allow", "deny", "require_approval"]
 
@@ -35,6 +35,22 @@ class PermissionRequest(BaseModel):
         default_factory=dict,
         description="Free-form context for rules (tenant_id, environment, etc.).",
     )
+
+
+class TrustedCardContext(BaseModel):
+    """Runtime facts asserted by the embedding host, never by the MCP request.
+
+    Construct this only after the host authenticates the caller, resolves the
+    buyer and vendor resource, and checks each condition. This model validates
+    shape, but cannot establish the host's authority by itself.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    buyer_id: str = Field(..., min_length=1, max_length=256)
+    vendor_id: str = Field(..., min_length=1, max_length=512)
+    action: Literal["use"]
+    conditions_satisfied: dict[str, StrictBool] = Field(default_factory=dict)
 
 
 class _Because(BaseModel):

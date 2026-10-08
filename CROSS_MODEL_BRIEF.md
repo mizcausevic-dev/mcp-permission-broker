@@ -8,14 +8,14 @@
 
 ### What this repo IS
 
-`mcp-permission-broker` is an embeddable Python rule evaluator. It has pydantic v2 models, an in-memory `PolicyBundle.rules[]` registry, deny-trumps-allow evaluation, and optional best-effort audit POSTs. It does not currently bridge Decision Cards to MCP traffic; a host must explicitly call it before tool execution.
+`mcp-permission-broker` is an embeddable Python rule evaluator. It has pydantic v2 models, an in-memory `PolicyBundle.rules[]` registry, a separate raw signed-card gate backed by `policy-as-code-engine==0.2.0`, deny-trumps-allow evaluation, and optional best-effort audit POSTs. A host must explicitly call it before tool execution.
 
 ### What this repo is NOT
 
 | It's not | Because that's already covered by |
 | --- | --- |
 | A Decision Card editor or generator | [`procurement-decision-api`](https://github.com/mizcausevic-dev/procurement-decision-api) drafts Decision Cards |
-| Compatible with the policy-as-code-engine bundle output | That engine emits `policies[]` with scope and effective dates; this library accepts `rules[]`. No adapter is shipped. |
+| A serialized `policies[]` importer | Engine bundles have no signature proof. The broker converts a raw attested card with pinned buyer authority, then evaluates the typed bundle privately. |
 | An MCP server | This is a library you embed in *your* MCP server's request handler — not a server itself |
 | An audit log | Optional best-effort POSTs go to `AUDIT_STREAM_URL`; this library does not guarantee delivery or retention. |
 | A web UI | The dashboard / visual control plane lives in `mcp-permission-broker-dashboard` (separate repo, in flight). The library is headless and embeddable. |
@@ -25,17 +25,17 @@
 This is the term most consistently mis-modeled by other LLMs when they see this repo:
 
 - A **PolicyRule** is one row in this library's PolicyBundle `rules[]` array. It has `id`, `priority`, `effect`, `tool_name` (regex), `caller_id` (regex), optional `when.expr`, and optional unverified `because` metadata.
-- A **Decision Card** is the buyer's whole published document at `/.well-known/decisions/<id>.json`. The current `policy-as-code-engine` converter produces a distinct bundle with `policies[]`, not this library's `PolicyRule`s.
+- A **Decision Card** is the buyer's whole published document at `/.well-known/decisions/<id>.json`. The `policy-as-code-engine` converter produces a distinct bundle with `policies[]`, not this library's `PolicyRule`s. The broker verifies the card through that converter only when the host pins buyer authority and enables the signed-card gate.
 
 These are NOT the same thing. A `DecisionCard` class that wraps `name + pattern + decision + rationale` (as one sibling implementation has) is conflating a `PolicyRule` with a Decision Card. Use the canonical names.
 
 ### What's authoritative in this repo
 
-- The Python API surface (`Broker`, `PermissionRequest`, `PermissionDecision`, `PolicyBundle`, `PolicyRule`, `Outcome`) for this library. Do not infer contract compatibility from similar class names.
+- The Python API surface (`Broker`, `PermissionRequest`, `TrustedCardContext`, `PermissionDecision`, `PolicyBundle`, `PolicyRule`, `Outcome`) for this library. Do not infer contract compatibility from similar class names.
 - Deny-trumps-allow → require_approval → first allow → default — this evaluation order is the contract. Don't reorder it.
 - Regex match grammar for `tool_name` and `caller_id` — the engine internal. Buyer-facing UIs may surface wildcards (`fs.*delete*`), but they MUST compile to regex before evaluation so behavior stays consistent.
-- Python `re` matching has no timeout. Request strings and patterns are capped at 256 characters, but crafted backtracking patterns remain a denial-of-service risk. Only reviewed policies should be loaded until a time-bounded matcher exists.
-- Best-effort, never-raised `AUDIT_STREAM_URL` POSTs. A successful broker decision is not proof that an audit event reached or was accepted by a sink.
+- Local rule regex matching uses a 20 ms per-match timeout and 256-character caps on patterns and identity/tool strings. Policy count can still multiply latency; load only reviewed policies and bound their count at the embedding host.
+- Best-effort, never-raised authenticated POSTs to `AUDIT_STREAM_URL` `/events` using `AUDIT_STREAM_TOKEN`. A successful broker decision is not proof that an audit event reached or was accepted by a sink.
 
 ### What's open to reinterpret
 

@@ -5,12 +5,17 @@ from __future__ import annotations
 import ast
 import logging
 import os
-import re
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 import httpx
+import regex
 import yaml
+from policy_as_code_engine import EvaluationContext, PolicyEvaluator
+from policy_as_code_engine.card_attestation import CardAttestation
+from policy_as_code_engine.from_decision_card import policy_bundle_from_decision_card
+from policy_as_code_engine.models import PolicyBundle as CardPolicyBundle
 
 from mcp_permission_broker.models import (
     Outcome,
@@ -18,6 +23,7 @@ from mcp_permission_broker.models import (
     PermissionRequest,
     PolicyBundle,
     PolicyRule,
+    TrustedCardContext,
 )
 
 logger = logging.getLogger(__name__)
@@ -27,6 +33,7 @@ _AUDIT_EVENT_KIND: dict[Outcome, str] = {
     "deny": "tool_invocation_denied",
     "require_approval": "tool_invocation_required_approval",
 }
+_LOCAL_REGEX_TIMEOUT_SECONDS = 0.02
 
 
 class Broker:
@@ -38,9 +45,13 @@ class Broker:
         What to return when no rule matches. Defaults to ``"deny"`` (governed
         posture); pass ``"allow"`` for permissive deployments.
     audit_stream_url:
-        If provided, every decision is best-effort POSTed to this URL. If
+        If provided, every decision is best-effort POSTed to its /events endpoint. If
         None, falls back to the ``AUDIT_STREAM_URL`` environment variable.
         Set to empty string to disable explicitly.
+    require_signed_card:
+        Require a Decision Card converted locally from a buyer-attested card.
+        Until one is loaded, every request is denied. When local rules are also
+        loaded, both gates must allow the request.
     """
 
     def __init__(
@@ -48,21 +59,75 @@ class Broker:
         *,
         default_outcome: Outcome = "deny",
         audit_stream_url: str | None = None,
+        require_signed_card: bool = False,
     ) -> None:
         self._bundles: dict[str, PolicyBundle] = {}
         self._default_outcome: Outcome = default_outcome
+        self._card_lock = RLock()
+        self._card_generation = 0
+        self._signed_card_required = require_signed_card
+        self._card_bundle: CardPolicyBundle | None = None
+        self._expected_buyer_id: str | None = None
+        self._card_evaluator = PolicyEvaluator()
         if audit_stream_url is None:
             audit_stream_url = os.environ.get("AUDIT_STREAM_URL", "")
-        self._audit_stream_url = audit_stream_url
+        self._audit_stream_url = _audit_events_url(audit_stream_url)
+        self._audit_stream_token = os.environ.get("AUDIT_STREAM_TOKEN", "")
 
     # ------------------------------------------------------------------ load
 
     def add_bundle(self, bundle: PolicyBundle) -> None:
         """Register a PolicyBundle in memory, replacing any prior bundle with the same id."""
+        if not isinstance(bundle, PolicyBundle):
+            raise TypeError("add_bundle accepts only local rules[] PolicyBundle instances")
         self._bundles[bundle.bundle_id] = bundle
 
     def remove_bundle(self, bundle_id: str) -> None:
         self._bundles.pop(bundle_id, None)
+
+    def add_signed_decision_card(
+        self,
+        card: dict[str, Any],
+        *,
+        attestation: CardAttestation,
+        expected_buyer_id: str,
+        trusted_key_url: str,
+        trusted_public_key: bytes,
+    ) -> None:
+        """Convert a raw buyer-attested card with independently pinned trust.
+
+        A serialized ``policies[]`` bundle is deliberately not accepted: it has
+        no proof of its Decision Card origin. A failed reload invalidates the
+        previous card, so a rejected or tampered replacement cannot leave an
+        older approval active.
+        """
+        with self._card_lock:
+            self._card_generation += 1
+            generation = self._card_generation
+            self._signed_card_required = True
+            self._card_bundle = None
+            self._expected_buyer_id = None
+        buyer = card.get("buyer") if isinstance(card, dict) else None
+        if (
+            not expected_buyer_id
+            or not isinstance(buyer, dict)
+            or buyer.get("id") != expected_buyer_id
+        ):
+            raise ValueError("Decision Card buyer does not match pinned buyer ID")
+        if not trusted_key_url or len(trusted_public_key) != 32:
+            raise ValueError("Decision Card buyer key is not pinned")
+        bundle = policy_bundle_from_decision_card(
+            card,
+            allowed_actions=["use"],
+            attestation=attestation,
+            trusted_key_url=trusted_key_url,
+            trusted_public_key=trusted_public_key,
+        )
+        with self._card_lock:
+            if generation != self._card_generation:
+                raise RuntimeError("Decision Card reload was superseded")
+            self._expected_buyer_id = expected_buyer_id
+            self._card_bundle = bundle
 
     @property
     def bundle_ids(self) -> list[str]:
@@ -82,8 +147,76 @@ class Broker:
 
     # ------------------------------------------------------------------ check
 
-    def check(self, request: PermissionRequest) -> PermissionDecision:
+    def check(
+        self,
+        request: PermissionRequest,
+        *,
+        trusted_card_context: TrustedCardContext | None = None,
+    ) -> PermissionDecision:
         """Evaluate the request. Returns a PermissionDecision and emits an audit event."""
+        card_decision = self._check_signed_card(trusted_card_context)
+        if card_decision is not None and card_decision.outcome != "allow":
+            self._emit_audit(card_decision, request)
+            return card_decision
+
+        if self._bundles:
+            decision = self._check_local_rules(request)
+            if card_decision is not None and decision.outcome == "allow":
+                decision.matched_rules = card_decision.matched_rules + decision.matched_rules
+                decision.rationale = "Signed Decision Card and local rules allowed"
+        elif card_decision is not None:
+            decision = card_decision
+        else:
+            decision = PermissionDecision(
+                outcome=self._default_outcome,
+                rationale=f"No rule matched — default {self._default_outcome}",
+            )
+        self._emit_audit(decision, request)
+        return decision
+
+    def _check_signed_card(self, context: TrustedCardContext | None) -> PermissionDecision | None:
+        with self._card_lock:
+            return self._check_signed_card_locked(context)
+
+    def _check_signed_card_locked(
+        self, context: TrustedCardContext | None
+    ) -> PermissionDecision | None:
+        if not self._signed_card_required:
+            if context is not None:
+                return PermissionDecision(
+                    outcome="deny", rationale="No signed Decision Card gate configured"
+                )
+            return None
+        if self._card_bundle is None or self._expected_buyer_id is None:
+            return PermissionDecision(outcome="deny", rationale="Signed Decision Card missing")
+        if context is None or not isinstance(context, TrustedCardContext):
+            return PermissionDecision(outcome="deny", rationale="Trusted card context missing")
+        if context.buyer_id != self._expected_buyer_id:
+            return PermissionDecision(outcome="deny", rationale="Buyer scope mismatch")
+        try:
+            result = self._card_evaluator.evaluate(
+                self._card_bundle,
+                EvaluationContext(
+                    data={"conditions_satisfied": dict(context.conditions_satisfied)},
+                    action=context.action,
+                    resource={"vendor_id": context.vendor_id},
+                ),
+            )
+        except Exception as exc:
+            logger.warning("signed card evaluation failed: %s", type(exc).__name__)
+            return PermissionDecision(outcome="deny", rationale="Signed card evaluation failed")
+        matched = result.decision.matched_rule_id or result.decision.matched_policy_id
+        return PermissionDecision(
+            outcome="allow" if result.decision.kind == "allow" else "deny",
+            matched_rules=[f"card:{matched}"] if matched else [],
+            rationale=(
+                "Signed Decision Card allowed"
+                if result.decision.kind == "allow"
+                else "Signed Decision Card denied"
+            ),
+        )
+
+    def _check_local_rules(self, request: PermissionRequest) -> PermissionDecision:
         matches: list[tuple[PolicyRule, PolicyBundle]] = []
         for bundle in self._bundles.values():
             for rule in bundle.rules:
@@ -102,22 +235,23 @@ class Broker:
                         decision_card_refs=_card_refs(bundle),
                         rationale=f"Policy rule {rule.id} failed to evaluate",
                     )
-                    self._emit_audit(decision, request)
                     return decision
 
         # Sort by priority descending so the first deny we encounter is the highest-priority one.
         matches.sort(key=lambda pair: pair[0].priority, reverse=True)
 
-        decision = self._resolve(matches, request)
-        self._emit_audit(decision, request)
-        return decision
+        return self._resolve(matches, request)
 
     # -------------------------------------------------------------- internals
 
     def _rule_matches(self, rule: PolicyRule, request: PermissionRequest) -> bool:
-        if not re.fullmatch(rule.tool_name, request.tool_name):
+        if not regex.fullmatch(
+            rule.tool_name, request.tool_name, timeout=_LOCAL_REGEX_TIMEOUT_SECONDS
+        ):
             return False
-        if not re.fullmatch(rule.caller_id, request.caller_id):
+        if not regex.fullmatch(
+            rule.caller_id, request.caller_id, timeout=_LOCAL_REGEX_TIMEOUT_SECONDS
+        ):
             return False
         if rule.when is not None:
             if set(rule.when) != {"expr"} or not rule.when["expr"].strip():
@@ -161,9 +295,10 @@ class Broker:
                 )
 
         # 4) Default.
+        default_outcome: Outcome = "deny" if self._signed_card_required else self._default_outcome
         return PermissionDecision(
-            outcome=self._default_outcome,
-            rationale=f"No rule matched — default {self._default_outcome}",
+            outcome=default_outcome,
+            rationale=f"No rule matched — default {default_outcome}",
         )
 
     def _emit_audit(self, decision: PermissionDecision, request: PermissionRequest) -> None:
@@ -181,12 +316,44 @@ class Broker:
                 "rationale": decision.rationale,
             },
         }
-        # Best-effort. Never raised.
+        # Best-effort. Never raised. A missing token cannot be sent as anonymous
+        # audit evidence to a sink that requires authenticated producers.
+        if not self._audit_stream_token.strip():
+            logger.warning("audit-stream POST skipped: AUDIT_STREAM_TOKEN is missing")
+            return
         try:
-            response = httpx.post(self._audit_stream_url, json=event, timeout=2.0)
+            response = httpx.post(
+                self._audit_stream_url,
+                json=event,
+                headers={"Authorization": f"Bearer {self._audit_stream_token}"},
+                timeout=2.0,
+            )
             response.raise_for_status()
         except Exception as exc:
             logger.warning("audit-stream POST failed (best-effort): %s", type(exc).__name__)
+
+
+def _audit_events_url(raw_url: str) -> str:
+    """Accept the documented sink base URL and the legacy exact endpoint URL."""
+    if not raw_url:
+        return ""
+    try:
+        url = httpx.URL(raw_url)
+    except httpx.InvalidURL:
+        raise ValueError("invalid audit stream URL") from None
+    if (
+        url.scheme not in {"http", "https"}
+        or not url.host
+        or url.userinfo
+        or url.query
+        or url.fragment
+        or (url.scheme == "http" and url.host not in {"localhost", "127.0.0.1", "::1"})
+    ):
+        raise ValueError("audit stream URL must be HTTPS or loopback HTTP without credentials")
+    path = url.path.rstrip("/")
+    if not path.endswith("/events"):
+        path += "/events"
+    return str(url.copy_with(path=path))
 
 
 def _card_refs(bundle: PolicyBundle) -> list[str]:

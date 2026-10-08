@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 from pathlib import Path
+from threading import Event, Thread
+from typing import Any
 
 import httpx
 import pytest
+import rfc8785
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from policy_as_code_engine.card_attestation import CardAttestation
 from pydantic import ValidationError
 
 from mcp_permission_broker import (
@@ -11,6 +18,7 @@ from mcp_permission_broker import (
     PermissionRequest,
     PolicyBundle,
     PolicyRule,
+    TrustedCardContext,
 )
 
 EXAMPLES = Path(__file__).parent.parent / "examples"
@@ -199,20 +207,46 @@ def test_invalid_regex_denies_instead_of_crashing() -> None:
     assert decision.matched_rules == ["bad-regex"]
 
 
+def test_local_regex_timeout_denies(monkeypatch: pytest.MonkeyPatch) -> None:
+    def timed_out(pattern: str, value: str, *, timeout: float) -> None:
+        assert timeout == 0.02
+        raise TimeoutError
+
+    monkeypatch.setattr("mcp_permission_broker.broker.regex.fullmatch", timed_out)
+    broker = Broker(default_outcome="allow")
+    broker.add_bundle(
+        PolicyBundle(
+            bundle_id="local",
+            rules=[PolicyRule(id="slow", effect="allow", tool_name=r"(a|aa)+$")],
+        )
+    )
+    decision = broker.check(_request(tool_name="a" * 255 + "!"))
+    assert decision.outcome == "deny"
+    assert decision.matched_rules == ["slow"]
+
+
+@pytest.mark.parametrize("status", [401, 503])
 def test_non_2xx_audit_response_is_logged_without_leaking_url(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, status: int
 ) -> None:
     events: list[dict[str, object]] = []
+    urls: list[str] = []
+    monkeypatch.setenv("AUDIT_STREAM_TOKEN", "secret-audit-token")
 
-    def failed_post(url: str, *, json: dict[str, object], timeout: float) -> httpx.Response:
+    def failed_post(
+        url: str, *, json: dict[str, object], headers: dict[str, str], timeout: float
+    ) -> httpx.Response:
         events.append(json)
-        return httpx.Response(503, request=httpx.Request("POST", url))
+        urls.append(url)
+        assert headers == {"Authorization": "Bearer secret-audit-token"}
+        return httpx.Response(status, request=httpx.Request("POST", url))
 
     monkeypatch.setattr("mcp_permission_broker.broker.httpx.post", failed_post)
     broker = Broker(audit_stream_url="https://audit.example/secret-in-url")
     decision = broker.check(_request(tool_args={"sensitive": "never-log"}))
     assert decision.outcome == "deny"
     assert events[0]["kind"] == "tool_invocation_denied"
+    assert urls == ["https://audit.example/secret-in-url/events"]
     assert events[0]["source"] == "mcp-permission-broker"
     assert isinstance(events[0]["payload"], dict)
     assert events[0]["payload"]["correlation_id"] == decision.correlation_id
@@ -220,6 +254,253 @@ def test_non_2xx_audit_response_is_logged_without_leaking_url(
     assert "context" not in events[0]
     assert "HTTPStatusError" in caplog.text
     assert "secret-in-url" not in caplog.text
+    assert "secret-audit-token" not in caplog.text
+
+
+def test_audit_legacy_events_endpoint_is_not_duplicated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urls: list[str] = []
+    monkeypatch.setenv("AUDIT_STREAM_TOKEN", "local-test-token")
+
+    def accepted_post(
+        url: str, *, json: dict[str, object], headers: dict[str, str], timeout: float
+    ) -> httpx.Response:
+        urls.append(url)
+        assert headers == {"Authorization": "Bearer local-test-token"}
+        return httpx.Response(201, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr("mcp_permission_broker.broker.httpx.post", accepted_post)
+    Broker(audit_stream_url="https://audit.example/events").check(_request())
+    assert urls == ["https://audit.example/events"]
+
+
+def test_audit_missing_token_skips_post(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.delenv("AUDIT_STREAM_TOKEN", raising=False)
+
+    def unexpected_post(*args: object, **kwargs: object) -> None:
+        pytest.fail("anonymous audit POST must not be attempted")
+
+    monkeypatch.setattr("mcp_permission_broker.broker.httpx.post", unexpected_post)
+    Broker(audit_stream_url="https://audit.example").check(_request())
+    assert "AUDIT_STREAM_TOKEN is missing" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://audit.example",
+        "https://user:password@audit.example",
+        "https://audit.example?token=secret",
+        "file:///tmp/audit.sock",
+    ],
+)
+def test_audit_rejects_insecure_or_credentialed_url(url: str) -> None:
+    with pytest.raises(ValueError, match="audit stream URL"):
+        Broker(audit_stream_url=url)
+
+
+def _signed_card(
+    *,
+    status: str = "approved",
+    conditions: list[dict[str, str]] | None = None,
+    effective_until: str = "2999-01-01T00:00:00Z",
+) -> tuple[dict[str, Any], CardAttestation, bytes]:
+    card: dict[str, Any] = {
+        "decision_card_version": "0.1",
+        "decision_id": "TEST-001",
+        "issued_at": "2026-05-14T19:00:00Z",
+        "buyer": {"id": "buyer-1", "name": "Buyer One", "type": "school-district"},
+        "decision": {"status": status, "effective_until": effective_until},
+        "subject": {"vendor_name": "Vendor One", "vendor_id": "vendor-1"},
+        "rationale": "Synthetic test fixture.",
+    }
+    if conditions is not None:
+        card["conditions"] = conditions
+    key = Ed25519PrivateKey.from_private_bytes(bytes([7] * 32))
+    fields = {
+        "algorithm": "ed25519",
+        "hash_profile": "jcs-rfc8785-v1",
+        "signed_hash": "sha256:" + hashlib.sha256(rfc8785.dumps(card)).hexdigest(),
+        "key_url": "https://buyer.example/keys/card",
+        "signed_at": "2026-10-07T12:00:00Z",
+    }
+    signature = key.sign(b"hash-attestation/v2\x00" + rfc8785.dumps(fields))
+    attestation = CardAttestation(**fields, signature=base64.b64encode(signature).decode("ascii"))
+    return card, attestation, key.public_key().public_bytes_raw()
+
+
+def _load_card(
+    broker: Broker, card: dict[str, Any], attestation: CardAttestation, key: bytes
+) -> None:
+    broker.add_signed_decision_card(
+        card,
+        attestation=attestation,
+        expected_buyer_id="buyer-1",
+        trusted_key_url="https://buyer.example/keys/card",
+        trusted_public_key=key,
+    )
+
+
+def _trusted_context(**overrides: object) -> TrustedCardContext:
+    values: dict[str, object] = {
+        "buyer_id": "buyer-1",
+        "vendor_id": "vendor-1",
+        "action": "use",
+        "conditions_satisfied": {},
+    }
+    values.update(overrides)
+    return TrustedCardContext.model_validate(values)
+
+
+def test_signed_card_gate_allows_only_attested_scoped_card() -> None:
+    card, attestation, key = _signed_card()
+    broker = Broker(require_signed_card=True)
+    assert broker.check(_request(), trusted_card_context=_trusted_context()).outcome == "deny"
+    _load_card(broker, card, attestation, key)
+    assert broker.check(_request(), trusted_card_context=_trusted_context()).outcome == "allow"
+    assert broker.check(_request()).outcome == "deny"
+    assert (
+        broker.check(_request(), trusted_card_context=_trusted_context(buyer_id="other")).outcome
+        == "deny"
+    )
+    assert (
+        broker.check(_request(), trusted_card_context=_trusted_context(vendor_id="other")).outcome
+        == "deny"
+    )
+
+
+def test_untrusted_request_context_cannot_satisfy_signed_card_conditions() -> None:
+    card, attestation, key = _signed_card(
+        status="approved-with-conditions",
+        conditions=[{"id": "dpa-signed", "description": "DPA on file"}],
+    )
+    broker = Broker(require_signed_card=True)
+    _load_card(broker, card, attestation, key)
+    spoofed = _request(
+        context={
+            "buyer_id": "buyer-1",
+            "vendor_id": "vendor-1",
+            "conditions_satisfied": {"dpa-signed": True},
+        }
+    )
+    assert broker.check(spoofed).outcome == "deny"
+    assert broker.check(spoofed, trusted_card_context=_trusted_context()).outcome == "deny"
+    assert (
+        broker.check(
+            _request(),
+            trusted_card_context=_trusted_context(conditions_satisfied={"dpa-signed": True}),
+        ).outcome
+        == "allow"
+    )
+    with pytest.raises(ValidationError):
+        _trusted_context(conditions_satisfied={"dpa-signed": 1})
+
+
+def test_signed_card_and_local_rules_must_both_allow() -> None:
+    card, attestation, key = _signed_card()
+    broker = Broker(require_signed_card=True, default_outcome="allow")
+    _load_card(broker, card, attestation, key)
+    broker.add_bundle(
+        PolicyBundle(
+            bundle_id="local",
+            rules=[
+                PolicyRule(id="read-only", effect="allow", tool_name=r"^filesystem\.read_file$")
+            ],
+        )
+    )
+    assert broker.check(_request(), trusted_card_context=_trusted_context()).outcome == "allow"
+    assert (
+        broker.check(
+            _request(tool_name="filesystem.delete_file"),
+            trusted_card_context=_trusted_context(),
+        ).outcome
+        == "deny"
+    )
+
+
+def test_signed_card_rejects_tamper_and_failed_reload_invalidates_prior_allow() -> None:
+    card, attestation, key = _signed_card()
+    broker = Broker(require_signed_card=True)
+    _load_card(broker, card, attestation, key)
+    assert broker.check(_request(), trusted_card_context=_trusted_context()).outcome == "allow"
+    tampered = {**card, "rationale": "changed after signature"}
+    with pytest.raises(ValueError):
+        _load_card(broker, tampered, attestation, key)
+    assert broker.check(_request(), trusted_card_context=_trusted_context()).outcome == "deny"
+    with pytest.raises(ValueError, match="buyer"):
+        broker.add_signed_decision_card(
+            card,
+            attestation=attestation,
+            expected_buyer_id="wrong-buyer",
+            trusted_key_url="https://buyer.example/keys/card",
+            trusted_public_key=key,
+        )
+    assert broker.check(_request(), trusted_card_context=_trusted_context()).outcome == "deny"
+
+
+def test_superseded_card_reload_cannot_restore_old_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    approved, attestation, key = _signed_card()
+    withdrawn, withdrawn_attestation, _ = _signed_card(status="withdrawn")
+    broker = Broker(require_signed_card=True)
+    from mcp_permission_broker import broker as broker_module
+
+    real_converter = broker_module.policy_bundle_from_decision_card
+    entered = Event()
+    resume = Event()
+    errors: list[Exception] = []
+
+    def delayed_converter(card: dict[str, Any], **kwargs: Any) -> Any:
+        if card["decision"]["status"] == "approved":
+            entered.set()
+            assert resume.wait(5)
+        return real_converter(card, **kwargs)
+
+    def load_approved() -> None:
+        try:
+            _load_card(broker, approved, attestation, key)
+        except Exception as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(broker_module, "policy_bundle_from_decision_card", delayed_converter)
+    thread = Thread(target=load_approved)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        assert broker.check(_request(), trusted_card_context=_trusted_context()).outcome == "deny"
+        _load_card(broker, withdrawn, withdrawn_attestation, key)
+    finally:
+        resume.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], RuntimeError)
+    assert broker.check(_request(), trusted_card_context=_trusted_context()).outcome == "deny"
+
+
+@pytest.mark.parametrize("status", ["withdrawn", "expired"])
+def test_terminal_card_status_denies(status: str) -> None:
+    card, attestation, key = _signed_card(status=status)
+    broker = Broker(require_signed_card=True)
+    _load_card(broker, card, attestation, key)
+    assert broker.check(_request(), trusted_card_context=_trusted_context()).outcome == "deny"
+
+
+def test_expired_effective_window_denies() -> None:
+    card, attestation, key = _signed_card(effective_until="2026-10-07T23:00:00Z")
+    broker = Broker(require_signed_card=True)
+    _load_card(broker, card, attestation, key)
+    assert broker.check(_request(), trusted_card_context=_trusted_context()).outcome == "deny"
+
+
+def test_serialized_unsigned_engine_bundle_is_not_accepted() -> None:
+    broker = Broker(require_signed_card=True)
+    with pytest.raises(TypeError):
+        broker.add_bundle({"bundle_id": "fake", "policies": []})  # type: ignore[arg-type]
+    assert broker.check(_request(), trusted_card_context=_trusted_context()).outcome == "deny"
 
 
 def test_failed_deny_condition_cannot_fall_through_to_allow() -> None:

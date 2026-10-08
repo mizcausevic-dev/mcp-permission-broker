@@ -19,6 +19,7 @@ from mcp_permission_broker.models import (
     PermissionRequest,
     PolicyBundle,
     PolicyRule,
+    TrustedCardContext,
 )
 
 __all__ = [
@@ -28,5 +29,6 @@ __all__ = [
     "PermissionRequest",
     "PolicyBundle",
     "PolicyRule",
+    "TrustedCardContext",
 ]
 __version__ = "0.1.0"

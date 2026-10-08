@@ -2,13 +2,13 @@
 
 > An embeddable rule evaluator for MCP tool calls. Integration and authority checks are the caller's responsibility.
 
-`mcp-permission-broker` evaluates locally loaded `PolicyBundle.rules[]` against a `PermissionRequest`. An MCP server must call `Broker.check()` before executing each tool and block every outcome other than `allow`. This package does not intercept MCP traffic, authenticate callers, fetch or verify Decision Cards, or convert them into its rule format.
+`mcp-permission-broker` evaluates locally loaded `PolicyBundle.rules[]` against a `PermissionRequest`. A separate signed-card gate converts a raw Decision Card with `policy-as-code-engine==0.2.0` and evaluates its scoped `policies[]` with that engine. An MCP server must call `Broker.check()` before executing each tool and block every outcome other than `allow`. This package does not intercept MCP traffic or authenticate callers.
 
-The current [`policy-as-code-engine`](https://github.com/mizcausevic-dev/policy-as-code-engine) converter emits a different `PolicyBundle.policies[]` contract with scope, effective dates, and buyer-attestation checks. Its output cannot be loaded into this broker's `PolicyBundle.rules[]` model. No bridge between those contracts is shipped here.
+The two bundle formats remain distinct. A serialized `policies[]` bundle has no signature or proof that it came from a verified card; the broker does not accept one as signed. The signed-card gate calls the engine's converter on the raw card with an independently pinned buyer ID and Ed25519 public key, then keeps the resulting typed bundle in memory. This is an in-process prototype, not a hosted MCP authorization boundary.
 
 ## Why this exists
 
-The library supplies a local allow/deny/approval decision. It can be useful inside an MCP server, but a production authorization boundary also needs authenticated caller and buyer identities, trusted policy loading, tenant and vendor scope, verified Decision Card attestation, effective-window checks, and a tested failure and rollback path. Those controls are not implemented here.
+The library supplies a local allow/deny/approval decision and checks a positive card's signature, buyer pin, vendor/action scope, conditions, and effective window in its optional signed-card path. A production authorization boundary still needs an authenticated MCP host, trusted caller-to-buyer mapping, independently checked condition signals, card refresh/revocation handling, durable accepted audit receipts, and a tested failure and rollback path. Those host and deployment controls are not implemented here.
 
 ```
 [operator loads a local rules[] YAML bundle]
@@ -76,17 +76,51 @@ Evaluation order:
 
 `when.expr` supports comparisons (`==`, `!=`, `in`, `not in`), `and`, `or`, `not`, constants, literal lists, `context['key']`, and `context.get('key', default)`. It is parsed as a restricted expression tree; Python attribute traversal and arbitrary calls are rejected. This is a local rule format, not the `policy-as-code-engine` matcher DSL.
 
-`caller_id`, `tool_name`, and each regex pattern are capped at 256 characters. Python `re` has no match timeout here; a crafted pattern with backtracking can still stall evaluation even at that size. Load only reviewed policy files. **Regex denial of service remains a release blocker for untrusted policies or caller/tool identifiers.**
+`caller_id`, `tool_name`, and each regex pattern are capped at 256 characters. Local rule matching uses the `regex` package with a 20 ms timeout per match; a timeout denies. A large number of reviewed rules can still multiply evaluation time, so constrain policy counts at the embedding host. Do not load unreviewed local rules.
+
+### Signed Decision Card gate
+
+Create `Broker(require_signed_card=True)` when a buyer decision is required. Until a valid signed card is loaded, `check()` denies every request. `add_signed_decision_card()` takes a raw card, its v2 `CardAttestation`, and an operator-pinned buyer ID, key URL, and 32-byte Ed25519 public key. It verifies a positive card through the policy engine's converter and clears the previous card before a failed reload. A loaded card marked withdrawn or expired, a tampered reload, or a card outside its effective window cannot allow. The only permitted card action is `use`.
+
+```python
+from mcp_permission_broker import Broker, PermissionRequest, TrustedCardContext
+
+# Load card and attestation from an operator-approved source. Independently pin
+# buyer_id, key URL, and public key outside the card or request payload.
+broker = Broker(require_signed_card=True)
+broker.add_signed_decision_card(
+    card,
+    attestation=attestation,
+    expected_buyer_id=buyer_id,
+    trusted_key_url=buyer_key_url,
+    trusted_public_key=buyer_public_key,
+)
+decision = broker.check(
+    PermissionRequest(caller_id=authenticated_caller, tool_name=tool_name),
+    trusted_card_context=TrustedCardContext(
+        buyer_id=authenticated_buyer,
+        vendor_id=resolved_vendor,
+        action="use",
+        conditions_satisfied=server_checked_conditions,
+    ),
+)
+if decision.outcome != "allow":
+    raise PermissionError("Tool invocation denied")
+```
+
+`TrustedCardContext` is a separate keyword argument so `PermissionRequest.context`, `tool_args`, and other caller-controlled input cannot supply card authority. The embedding host must authenticate `authenticated_caller` and `authenticated_buyer`, resolve `resolved_vendor`, and compute every condition assertion from trusted checks. The model validates values but cannot prove the host did that work. Missing context, a mismatched buyer or vendor, a false/missing condition, or an evaluator error denies. If local `rules[]` bundles are also loaded, the card and local rules must both allow. In that mode a local rule miss denies even if `default_outcome="allow"` was selected.
+
+Card signature verification happens when the card is loaded. The broker does not fetch updates or detect a later withdrawal until the host reloads the card. Do not use a stale in-memory approval as proof of current buyer consent. The `policy-as-code-engine` `policies[]` bundle is never accepted directly as a signed artifact.
 
 ### Audit-stream integration
 
-If `AUDIT_STREAM_URL` is set in the environment, the broker attempts to POST each decision to that endpoint as one of:
+If `AUDIT_STREAM_URL` and `AUDIT_STREAM_TOKEN` are set in the environment, the broker attempts to POST each decision to the sink's `/events` endpoint as one of:
 
 - `tool_invocation_allowed`
 - `tool_invocation_denied`
 - `tool_invocation_required_approval`
 
-POSTs are best effort. Set the URL to the trusted audit sink's `/events` endpoint. The body follows its `{kind, source, payload}` envelope; `payload` contains the asserted caller ID, tool name, rule IDs, and reference URLs, but excludes `tool_args` and `context`. Connection failures and non-2xx responses are logged without the endpoint URL and do not change the decision. The broker does not prove delivery or make its events tamper-evident; verify acceptance and retention at the sink independently.
+POSTs are best effort. Set `AUDIT_STREAM_URL` to the trusted sink base URL; a legacy URL already ending in `/events` is accepted. The URL must use HTTPS or loopback HTTP, with no embedded credentials, query, or fragment. `AUDIT_STREAM_TOKEN` is sent only in the Bearer header and is never logged. If the token is missing, no anonymous POST is attempted. The body follows the sink's `{kind, source, payload}` envelope; `payload` contains the asserted caller ID, tool name, rule IDs, and reference URLs, but excludes `tool_args`, request `context`, and trusted card condition signals. Connection failures and non-2xx responses are logged without the endpoint URL or token and do not change the decision. The broker does not prove delivery or make its events tamper-evident; verify acceptance and retention at the sink independently.
 
 Without `AUDIT_STREAM_URL` the broker emits decisions only to its return value — no HTTP traffic, no side effects, no crashes.
 
@@ -117,13 +151,9 @@ if decision.outcome != "allow":
 
 Wire it into your MCP server's request handler. Only `allow` may proceed. Deny or require-approval must block tool execution until a separate, authenticated approval flow exists. This example alone is not a production authorization boundary.
 
-## Bundle from a Decision Card
-
-No Decision Card loader or converter is implemented. The current `policy-as-code-engine` bundle has `policies[]`, `card_scope`, and effective dates, while this library accepts `rules[]`; Pydantic rejects the engine's output. Until a verified adapter or shared evaluator exists, do not treat a Decision Card approval as an allow rule in this broker.
-
 ## Status
 
-**v0.1.0** — pure library with an in-memory rule registry, YAML loading, deny-trumps-allow evaluator, and optional best-effort audit POST. There is no MCP server, HTTP API, hosted deployment, or verified Decision Card adapter.
+**Unreleased review branch, source version 0.1.0** — pure library with an in-memory local rule registry, a separate signed-card gate backed by `policy-as-code-engine==0.2.0`, and optional best-effort authenticated audit POST. There is no MCP server, HTTP API, hosted deployment, or verified host identity boundary.
 
 ## Place in the Kinetic Gain portfolio
 
