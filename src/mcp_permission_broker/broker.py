@@ -80,10 +80,12 @@ class Broker:
         """Register a PolicyBundle in memory, replacing any prior bundle with the same id."""
         if not isinstance(bundle, PolicyBundle):
             raise TypeError("add_bundle accepts only local rules[] PolicyBundle instances")
-        self._bundles[bundle.bundle_id] = bundle
+        with self._card_lock:
+            self._bundles[bundle.bundle_id] = bundle
 
     def remove_bundle(self, bundle_id: str) -> None:
-        self._bundles.pop(bundle_id, None)
+        with self._card_lock:
+            self._bundles.pop(bundle_id, None)
 
     def add_signed_decision_card(
         self,
@@ -131,7 +133,8 @@ class Broker:
 
     @property
     def bundle_ids(self) -> list[str]:
-        return sorted(self._bundles.keys())
+        with self._card_lock:
+            return sorted(self._bundles.keys())
 
     @classmethod
     def from_yaml_dir(cls, directory: str | Path, **kwargs: Any) -> Broker:
@@ -154,29 +157,26 @@ class Broker:
         trusted_card_context: TrustedCardContext | None = None,
     ) -> PermissionDecision:
         """Evaluate the request. Returns a PermissionDecision and emits an audit event."""
-        card_decision = self._check_signed_card(trusted_card_context)
-        if card_decision is not None and card_decision.outcome != "allow":
-            self._emit_audit(card_decision, request)
-            return card_decision
-
-        if self._bundles:
-            decision = self._check_local_rules(request)
-            if card_decision is not None and decision.outcome == "allow":
-                decision.matched_rules = card_decision.matched_rules + decision.matched_rules
-                decision.rationale = "Signed Decision Card and local rules allowed"
-        elif card_decision is not None:
-            decision = card_decision
-        else:
-            decision = PermissionDecision(
-                outcome=self._default_outcome,
-                rationale=f"No rule matched — default {self._default_outcome}",
-            )
+        # Card reload and local rule evaluation share a linearization point.
+        # Audit is outside the lock so a slow sink cannot delay revocation.
+        with self._card_lock:
+            card_decision = self._check_signed_card_locked(trusted_card_context)
+            if card_decision is not None and card_decision.outcome != "allow":
+                decision = card_decision
+            elif self._bundles:
+                decision = self._check_local_rules(request)
+                if card_decision is not None and decision.outcome == "allow":
+                    decision.matched_rules = card_decision.matched_rules + decision.matched_rules
+                    decision.rationale = "Signed Decision Card and local rules allowed"
+            elif card_decision is not None:
+                decision = card_decision
+            else:
+                decision = PermissionDecision(
+                    outcome=self._default_outcome,
+                    rationale=f"No rule matched — default {self._default_outcome}",
+                )
         self._emit_audit(decision, request)
         return decision
-
-    def _check_signed_card(self, context: TrustedCardContext | None) -> PermissionDecision | None:
-        with self._card_lock:
-            return self._check_signed_card_locked(context)
 
     def _check_signed_card_locked(
         self, context: TrustedCardContext | None
@@ -318,8 +318,10 @@ class Broker:
         }
         # Best-effort. Never raised. A missing token cannot be sent as anonymous
         # audit evidence to a sink that requires authenticated producers.
-        if not self._audit_stream_token.strip():
-            logger.warning("audit-stream POST skipped: AUDIT_STREAM_TOKEN is missing")
+        if len(self._audit_stream_token) < 32 or any(
+            not 33 <= ord(char) <= 126 for char in self._audit_stream_token
+        ):
+            logger.warning("audit-stream POST skipped: AUDIT_STREAM_TOKEN is missing or invalid")
             return
         try:
             response = httpx.post(

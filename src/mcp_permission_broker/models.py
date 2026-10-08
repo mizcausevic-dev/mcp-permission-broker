@@ -69,8 +69,8 @@ class _Because(BaseModel):
 class PolicyRule(BaseModel):
     """Local rule matched by regex and a restricted context condition grammar.
 
-    A condition cannot run Python code. Rule patterns still use Python ``re``
-    without a match timeout; load only reviewed patterns until that is fixed.
+    A condition cannot run Python code. Rule patterns use the ``regex`` package
+    with a 20 ms timeout per match; load only reviewed patterns.
     """
 
     model_config = ConfigDict(extra="forbid")

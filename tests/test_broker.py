@@ -22,6 +22,7 @@ from mcp_permission_broker import (
 )
 
 EXAMPLES = Path(__file__).parent.parent / "examples"
+TEST_AUDIT_TOKEN = "T" * 32
 
 
 def _request(**overrides: object) -> PermissionRequest:
@@ -231,14 +232,14 @@ def test_non_2xx_audit_response_is_logged_without_leaking_url(
 ) -> None:
     events: list[dict[str, object]] = []
     urls: list[str] = []
-    monkeypatch.setenv("AUDIT_STREAM_TOKEN", "secret-audit-token")
+    monkeypatch.setenv("AUDIT_STREAM_TOKEN", TEST_AUDIT_TOKEN)
 
     def failed_post(
         url: str, *, json: dict[str, object], headers: dict[str, str], timeout: float
     ) -> httpx.Response:
         events.append(json)
         urls.append(url)
-        assert headers == {"Authorization": "Bearer secret-audit-token"}
+        assert headers == {"Authorization": f"Bearer {TEST_AUDIT_TOKEN}"}
         return httpx.Response(status, request=httpx.Request("POST", url))
 
     monkeypatch.setattr("mcp_permission_broker.broker.httpx.post", failed_post)
@@ -254,20 +255,20 @@ def test_non_2xx_audit_response_is_logged_without_leaking_url(
     assert "context" not in events[0]
     assert "HTTPStatusError" in caplog.text
     assert "secret-in-url" not in caplog.text
-    assert "secret-audit-token" not in caplog.text
+    assert TEST_AUDIT_TOKEN not in caplog.text
 
 
 def test_audit_legacy_events_endpoint_is_not_duplicated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     urls: list[str] = []
-    monkeypatch.setenv("AUDIT_STREAM_TOKEN", "local-test-token")
+    monkeypatch.setenv("AUDIT_STREAM_TOKEN", TEST_AUDIT_TOKEN)
 
     def accepted_post(
         url: str, *, json: dict[str, object], headers: dict[str, str], timeout: float
     ) -> httpx.Response:
         urls.append(url)
-        assert headers == {"Authorization": "Bearer local-test-token"}
+        assert headers == {"Authorization": f"Bearer {TEST_AUDIT_TOKEN}"}
         return httpx.Response(201, request=httpx.Request("POST", url))
 
     monkeypatch.setattr("mcp_permission_broker.broker.httpx.post", accepted_post)
@@ -285,7 +286,22 @@ def test_audit_missing_token_skips_post(
 
     monkeypatch.setattr("mcp_permission_broker.broker.httpx.post", unexpected_post)
     Broker(audit_stream_url="https://audit.example").check(_request())
-    assert "AUDIT_STREAM_TOKEN is missing" in caplog.text
+    assert "AUDIT_STREAM_TOKEN is missing or invalid" in caplog.text
+
+
+@pytest.mark.parametrize("token", ["short", "T" * 31 + " ", "é" * 32])
+def test_audit_invalid_token_skips_post(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, token: str
+) -> None:
+    monkeypatch.setenv("AUDIT_STREAM_TOKEN", token)
+
+    def unexpected_post(*args: object, **kwargs: object) -> None:
+        pytest.fail("invalid audit token must not be sent")
+
+    monkeypatch.setattr("mcp_permission_broker.broker.httpx.post", unexpected_post)
+    Broker(audit_stream_url="https://audit.example").check(_request())
+    assert "AUDIT_STREAM_TOKEN is missing or invalid" in caplog.text
+    assert token not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -478,6 +494,59 @@ def test_superseded_card_reload_cannot_restore_old_approval(
         thread.join(5)
     assert not thread.is_alive()
     assert len(errors) == 1 and isinstance(errors[0], RuntimeError)
+    assert broker.check(_request(), trusted_card_context=_trusted_context()).outcome == "deny"
+
+
+def test_card_reload_waits_for_local_rule_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    approved, attestation, key = _signed_card()
+    withdrawn, withdrawn_attestation, _ = _signed_card(status="withdrawn")
+    broker = Broker(require_signed_card=True, audit_stream_url="")
+    _load_card(broker, approved, attestation, key)
+    broker.add_bundle(
+        PolicyBundle(
+            bundle_id="local",
+            rules=[PolicyRule(id="local-allow", effect="allow", when={"expr": "True"})],
+        )
+    )
+    from mcp_permission_broker import broker as broker_module
+
+    entered = Event()
+    resume = Event()
+    reload_started = Event()
+    reload_done = Event()
+    outcomes: list[str] = []
+
+    def blocked_condition(expr: str, context: dict[str, Any]) -> bool:
+        entered.set()
+        assert resume.wait(5)
+        return True
+
+    def check_in_thread() -> None:
+        outcomes.append(broker.check(_request(), trusted_card_context=_trusted_context()).outcome)
+
+    def reload_in_thread() -> None:
+        reload_started.set()
+        _load_card(broker, withdrawn, withdrawn_attestation, key)
+        reload_done.set()
+
+    monkeypatch.setattr(broker_module, "_evaluate_condition", blocked_condition)
+    check_thread = Thread(target=check_in_thread)
+    reload_thread = Thread(target=reload_in_thread)
+    check_thread.start()
+    try:
+        assert entered.wait(5)
+        reload_thread.start()
+        assert reload_started.wait(5)
+        assert not reload_done.wait(0.1)
+    finally:
+        resume.set()
+        check_thread.join(5)
+        if reload_thread.ident is not None:
+            reload_thread.join(5)
+    assert not check_thread.is_alive() and not reload_thread.is_alive()
+    assert outcomes == ["allow"]
     assert broker.check(_request(), trusted_card_context=_trusted_context()).outcome == "deny"
 
 
