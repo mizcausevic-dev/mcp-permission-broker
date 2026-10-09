@@ -1,14 +1,14 @@
 # mcp-permission-broker
 
-> An embeddable rule evaluator for MCP tool calls. Integration and authority checks are the caller's responsibility.
+> An embeddable rule evaluator for MCP tool calls, with an opt-in reference host gate for selected calls.
 
-`mcp-permission-broker` evaluates locally loaded `PolicyBundle.rules[]` against a `PermissionRequest`. A separate signed-card gate converts a raw Decision Card with `policy-as-code-engine==0.2.0` and evaluates its scoped `policies[]` with that engine. An MCP server must call `Broker.check()` before executing each tool and block every outcome other than `allow`. This package does not intercept MCP traffic or authenticate callers.
+`mcp-permission-broker` evaluates locally loaded `PolicyBundle.rules[]` against a `PermissionRequest`. A separate signed-card gate converts a raw Decision Card with `policy-as-code-engine==0.2.1` and evaluates its scoped `policies[]` with that engine. `Broker.check()` alone does not intercept MCP traffic or authenticate callers. The optional `AuthenticatedToolGate` wraps a host-owned `tools/call` dispatcher for a selected set of registered handlers. It is a reference integration, not an HTTP MCP server or a guard on the separately published TypeScript server.
 
 The two bundle formats remain distinct. A serialized `policies[]` bundle has no signature or proof that it came from a verified card; the broker does not accept one as signed. The signed-card gate calls the engine's converter on the raw card with an independently pinned buyer ID and Ed25519 public key, then keeps the resulting typed bundle in memory. This is an in-process prototype, not a hosted MCP authorization boundary.
 
 ## Why this exists
 
-The library supplies a local allow/deny/approval decision and checks a positive card's signature, buyer pin, vendor/action scope, conditions, and effective window in its optional signed-card path. A production authorization boundary still needs an authenticated MCP host, trusted caller-to-buyer mapping, independently checked condition signals, card refresh/revocation handling, durable accepted audit receipts, and a tested failure and rollback path. Those host and deployment controls are not implemented here.
+The library supplies a local allow/deny/approval decision and checks a positive card's signature, buyer pin, vendor/action scope, conditions, and effective window in its optional signed-card path. The reference gate adds pinned-token verification, server-owned caller/buyer/tenant/vendor/condition mappings, process-local revocation, and a required pre-dispatch audit receipt callback. A production boundary still needs a real authenticated MCP transport, exclusive routing through the gate, durable revocation and audit, trusted condition sources, and hosted failure/rollback proof.
 
 ```
 [operator loads a local rules[] YAML bundle]
@@ -112,6 +112,18 @@ if decision.outcome != "allow":
 
 Card signature verification happens when the card is loaded. The broker does not fetch updates or detect a later withdrawal until the host reloads the card. Do not use a stale in-memory approval as proof of current buyer consent. The `policy-as-code-engine` `policies[]` bundle is never accepted directly as a signed artifact.
 
+### Opt-in reference host gate
+
+Install the reviewed source with `pip install -e ".[host]"` to use `mcp_permission_broker.host_gate.AuthenticatedToolGate`. The host must pass the HTTP `Authorization` header separately from MCP `tools/call` parameters and make `dispatch()` its only path to the selected registered handlers. `dispatch()` accepts exactly `{name, arguments}`. It rejects added authority fields, including nested and normalized aliases, and bounds JSON arguments to 16 KiB, 16 levels, and 512 nodes. Every `ToolBinding` must provide a server-owned `validate_arguments` callback that returns a validated dict or raises; the gate rechecks and detaches its output before policy and handler receive the same copy. An unexpected field or type must fail that callback. The embedding transport must cap wire bytes **before** parsing a request into a Python dict.
+
+The gate accepts only Ed25519 JWTs verified against a host-pinned public key, issuer, and single audience. It requires `sub`, `client_id`, `scope` equal to `mcp:tools.call`, `jti`, `iat`, `nbf`, and `exp`; lifetime is capped at five minutes. The signed `sub` resolves to a server-owned `PrincipalBinding`, and the signed `client_id` must match that binding. Buyer and tenant are resolved from the binding, vendor and allowed tenants from the host's `ToolBinding`, and condition facts from host-owned callbacks that never receive tool arguments. No upstream bearer is forwarded to a handler. Missing or false facts, unknown tools, mismatched scopes, revoked IDs, or any non-allow broker decision deny before invocation.
+
+For every allowed decision, a host-owned `accepted_audit` callback must return an `AcceptedAuditReceipt` with `accepted is True`, the exact decision correlation ID, a positive `event_id`, and a lowercase 64-hex `hash`, matching the audit sink's accepted event shape. Missing, rejected, mismatched, or malformed receipts block the handler. Before entering the handler, the gate rechecks the JWT, trusted conditions, and Broker decision under the same lock; a token or card that expires during audit, or a condition that changes, blocks execution. A successful result retains the first receipt's correlation ID. This interface does not implement an audit sink or prove that the callback returned a committed event; the embedding host must verify the response and durability independently. Receipt acceptance is required **only for an allowed pre-dispatch decision**. Authentication failures, condition failures, denied decisions, a post-receipt denial, and execution outcomes are not guaranteed durable audit events here. Complete call history remains a production blocker. The broker's separate audit POST remains best effort and does not satisfy this gate; the adapter rejects a Broker with it enabled. Construct the reference broker with `audit_stream_url=""` so it cannot emit a misleading duplicate allow event before receipt acceptance.
+
+`revoke_jti()`, `revoke_caller()`, `revoke_buyer()`, `revoke_card()`, and `load_signed_decision_card()` use the same process-local lock as decision, accepted audit, and synchronous handler execution. This serializes all selected calls. Once revocation completes, a later dispatch cannot start its handler. An already running handler is not aborted; revocation waits for it to finish. A process restart loses these revocation sets and card generation, so a production host needs an independently controlled durable withdrawal source before it can trust a fresh process. Limit this reference path to bounded read-only handlers. A stuck condition, audit, or handler callback can delay revocation; hosted use requires timeouts and isolated execution. Recursive dispatch is denied.
+
+This adapter does not provide an MCP HTTP transport, token issuer, OAuth discovery, rate limiter, durable audit implementation, persistent revocation feed, or exclusive network routing. Tool argument validators must be pure and handlers must enforce resource-level tenant scope; a static tenant allowlist alone cannot prove data isolation. Code with a direct reference to a registered handler can bypass the gate. Direct mutation of the underlying `Broker` outside the adapter can also race invocation; use only the adapter's card-load/revocation methods for this reference path. The published `mcp-kinetic-gain` TypeScript stdio server still invokes its own handlers directly. Do not describe this reference adapter's tests as proof that that server or any hosted provider is protected.
+
 ### Audit-stream integration
 
 If `AUDIT_STREAM_URL` and `AUDIT_STREAM_TOKEN` are set in the environment, the broker attempts to POST each decision to the sink's `/events` endpoint as one of:
@@ -153,7 +165,7 @@ Wire it into your MCP server's request handler. Only `allow` may proceed. Deny o
 
 ## Status
 
-**Unreleased review branch, source version 0.1.0** — pure library with an in-memory local rule registry, a separate signed-card gate backed by `policy-as-code-engine==0.2.0`, and optional best-effort authenticated audit POST. There is no MCP server, HTTP API, hosted deployment, or verified host identity boundary.
+**Unreleased review branch, source version 0.1.0** — in-memory rule registry, signed-card gate backed by `policy-as-code-engine==0.2.1`, optional best-effort authenticated audit POST, and an opt-in reference host dispatcher with pinned-token checks. There is no MCP server, HTTP API, hosted deployment, durable revocation source, or verified exclusive host boundary.
 
 ## Place in the Kinetic Gain portfolio
 
@@ -162,7 +174,7 @@ Wire it into your MCP server's request handler. Only `allow` may proceed. Deny o
 | Spec the buyer publishes | [`ai-procurement-decision-spec`](https://github.com/mizcausevic-dev/ai-procurement-decision-spec) |
 | Drafting Decision Cards | [`procurement-decision-api`](https://github.com/mizcausevic-dev/procurement-decision-api) |
 | Building runtime bundles | [`policy-as-code-engine`](https://github.com/mizcausevic-dev/policy-as-code-engine) |
-| **Enforcing at MCP call time** | **`mcp-permission-broker` (this repo)** |
+| **Reference MCP call-time decision gate** | **`mcp-permission-broker` (this repo)** |
 | Walking the graph after an incident | [`incident-correlation-rs`](https://github.com/mizcausevic-dev/incident-correlation-rs) |
 | Tamper-evident audit spine | [`audit-stream-py`](https://github.com/mizcausevic-dev/audit-stream-py) |
 

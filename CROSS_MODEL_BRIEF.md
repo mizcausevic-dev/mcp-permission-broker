@@ -8,7 +8,7 @@
 
 ### What this repo IS
 
-`mcp-permission-broker` is an embeddable Python rule evaluator. It has pydantic v2 models, an in-memory `PolicyBundle.rules[]` registry, a separate raw signed-card gate backed by `policy-as-code-engine==0.2.0`, deny-trumps-allow evaluation, and optional best-effort audit POSTs. A host must explicitly call it before tool execution.
+`mcp-permission-broker` is an embeddable Python rule evaluator. It has pydantic v2 models, an in-memory `PolicyBundle.rules[]` registry, a separate raw signed-card gate backed by `policy-as-code-engine==0.2.1`, deny-trumps-allow evaluation, and optional best-effort audit POSTs. Its opt-in reference `AuthenticatedToolGate` verifies a pinned Ed25519 JWT and server-owned bindings before invoking selected synchronous handlers, requiring an accepted pre-dispatch audit callback. It is not an MCP transport or a guard on the published TypeScript server. A real host must route every selected call exclusively through it.
 
 ### What this repo is NOT
 

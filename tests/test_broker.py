@@ -515,6 +515,43 @@ def test_superseded_card_reload_cannot_restore_old_approval(
     assert broker.check(_request(), trusted_card_context=_trusted_context()).outcome == "deny"
 
 
+def test_revocation_supersedes_inflight_card_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    card, attestation, key = _signed_card()
+    broker = Broker(require_signed_card=True, audit_stream_url="")
+    from mcp_permission_broker import broker as broker_module
+
+    real_converter = broker_module.policy_bundle_from_decision_card
+    entered = Event()
+    resume = Event()
+    errors: list[Exception] = []
+
+    def delayed_converter(card: dict[str, Any], **kwargs: Any) -> Any:
+        entered.set()
+        assert resume.wait(5)
+        return real_converter(card, **kwargs)
+
+    def load() -> None:
+        try:
+            _load_card(broker, card, attestation, key)
+        except Exception as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(broker_module, "policy_bundle_from_decision_card", delayed_converter)
+    thread = Thread(target=load)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        broker.revoke_signed_decision_card()
+    finally:
+        resume.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], RuntimeError)
+    assert broker.check(_request(), trusted_card_context=_trusted_context()).outcome == "deny"
+
+
 def test_card_reload_waits_for_local_rule_decision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

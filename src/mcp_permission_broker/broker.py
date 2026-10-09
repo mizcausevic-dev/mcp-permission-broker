@@ -87,6 +87,23 @@ class Broker:
         with self._card_lock:
             self._bundles.pop(bundle_id, None)
 
+    def require_signed_card(self) -> None:
+        """Make an attested card mandatory, including when no card is loaded."""
+        with self._card_lock:
+            self._signed_card_required = True
+
+    def revoke_signed_decision_card(self) -> None:
+        """Invalidate this process's card and any conversion still in progress.
+
+        The caller must persist and distribute revocation independently. A
+        process restart does not remember this in-memory withdrawal.
+        """
+        with self._card_lock:
+            self._card_generation += 1
+            self._signed_card_required = True
+            self._card_bundle = None
+            self._expected_buyer_id = None
+
     def add_signed_decision_card(
         self,
         card: dict[str, Any],
@@ -135,6 +152,11 @@ class Broker:
     def bundle_ids(self) -> list[str]:
         with self._card_lock:
             return sorted(self._bundles.keys())
+
+    @property
+    def best_effort_audit_enabled(self) -> bool:
+        """Whether decisions may be POSTed without an accepted receipt."""
+        return bool(self._audit_stream_url)
 
     @classmethod
     def from_yaml_dir(cls, directory: str | Path, **kwargs: Any) -> Broker:
