@@ -124,6 +124,50 @@ For every allowed decision, a host-owned `accepted_audit` callback must return a
 
 This adapter does not provide an MCP HTTP transport, token issuer, OAuth discovery, rate limiter, durable audit implementation, persistent revocation feed, or exclusive network routing. Tool argument validators must be pure and handlers must enforce resource-level tenant scope; a static tenant allowlist alone cannot prove data isolation. Code with a direct reference to a registered handler can bypass the gate. Direct mutation of the underlying `Broker` outside the adapter can also race invocation; use only the adapter's card-load/revocation methods for this reference path. The published `mcp-kinetic-gain` TypeScript stdio server still invokes its own handlers directly. Do not describe this reference adapter's tests as proof that that server or any hosted provider is protected.
 
+### Private stdio signed-card bridge source pilot
+
+`python -I -m mcp_permission_broker.runtime_bridge <absolute-snapshot.json>`
+evaluates one request from a trusted parent over inherited stdin/stdout pipes. It
+has no network listener. The parent must first verify the MCP bearer token and
+pass only `{version, request_id, client_id, subject, jti, expires_at,
+tool_name}`. Do not pass the bearer, tool arguments, buyer, tenant, vendor, or
+condition claims. The child permits only `suite_doc_detect_spec`; it resolves
+buyer, tenant, vendor, conditions, signed raw Decision Card, pinned buyer key,
+and revocations from the operator-owned snapshot, then calls
+`Broker(require_signed_card=True, audit_stream_url="").check()`. Its response is
+only `{version, request_id, outcome, broker_correlation_id,
+signed_card_decision_id, state_sha256}`. The signed card ID is present only for
+an allowed, verified card; it is `null` on denial. The Broker correlation ID
+is a per-check UUID, not the buyer's card ID. Invalid
+configuration or evaluation exits nonzero with no decision JSON; the parent
+must deny execution.
+
+The snapshot must be an absolute-path regular JSON file of at most 96 KiB. It
+contains `version: 1`, `valid_until` no more than 300 seconds ahead,
+`expected_buyer_id`, `trusted_key_url`, standard-base64
+`trusted_public_key_b64`, raw `card`, v2 `attestation`,
+`principal_bindings` keyed by signed subject, `tool_bindings`, and
+`revoked_jtis`, `revoked_subjects`, `revoked_buyer_ids`, and
+`revoked_decision_ids` lists. Each principal binding contains `client_id`,
+`buyer_id`, `tenant_id`, and boolean `conditions_satisfied`; the selected tool
+binding contains `vendor_id` and `allowed_tenants`. Unknown keys and duplicate
+JSON keys fail closed. The child reads one bounded snapshot through one file
+descriptor and hashes those exact bytes. The parent must require two `allow`
+decisions with the same state digest, one before an accepted audit receipt and
+one immediately afterward. The [fixture generator](tests/create_runtime_bridge_fixture.py)
+creates a synthetic signed snapshot for tests; it does not issue real buyer
+approval.
+
+Snapshot files survive process restarts, unlike the in-memory reference gate,
+but an operator-owned file is not an authoritative revocation feed or a trusted
+condition source by itself. Protect the file and executable with operating
+system ACLs and atomic updates. An older still-valid snapshot can be replayed
+after a revocation, so an independently controlled monotonic revocation source
+is required for production. A card or revocation update after the second check
+can still race handler entry. The bridge has no token issuer, real buyer
+approval source, private hosted route, audit custodian, or hosted rollback
+proof. Do not publish it as a production authorization service.
+
 ### Audit-stream integration
 
 If `AUDIT_STREAM_URL` and `AUDIT_STREAM_TOKEN` are set in the environment, the broker attempts to POST each decision to the sink's `/events` endpoint as one of:
