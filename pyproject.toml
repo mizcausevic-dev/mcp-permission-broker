@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "mcp-permission-broker"
 version = "0.1.0"
-description = "Runtime permission broker for MCP tool invocations. Composes AI Procurement Decision Cards into PolicyBundles, applies deny-trumps-allow rules at request time, emits tamper-evident audit-stream events. The runtime enforcement point of the Kinetic Gain Protocol Suite."
+description = "In-process rule evaluator for MCP tool-call decisions with optional best-effort audit POSTs."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
@@ -34,16 +34,16 @@ dependencies = [
     "httpx>=0.27",
     "pydantic>=2.7",
     "PyYAML>=6.0",
+    "policy-as-code-engine==0.2.1",
+    "regex>=2024.11.6,<2027",
 ]
 
 [project.optional-dependencies]
-api = [
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.30",
+host = [
+    "PyJWT[crypto]==2.15.1",
 ]
 dev = [
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.30",
+    "PyJWT[crypto]==2.15.1",
     "httpx>=0.27",
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
